@@ -8,16 +8,16 @@ import numpy as np
 st.set_page_config(layout="wide", page_title="Society Migration Kanban Tracker")
 
 # --- Constants ---
-# NOTE: Ensure this filename matches your data file in the same directory.
-DATA_FILE = "societies_migration.csv"
+CANONICAL_DATA_FILE = "societies_migration.csv"
+RAW_SOURCE_FILE = "IBBN Store vs BBD Orders_Qty (1).xlsx - WORKING-Raw Data.csv"
 KANBAN_STAGES = ['Not Started', 'In Progress', 'Validation', 'Migrated', 'Issues']
 TODAY = datetime.now()
 
 
-# --- Dummy Data Generator (Runs only if the CSV is missing) ---
+# --- Dummy Data Generator (Runs only if BOTH the canonical and raw CSV are missing) ---
 def generate_dummy_data():
-    """Generates a sample CSV file if the actual data file is not found."""
-    st.warning(f"'{DATA_FILE}' not found. Generating dummy data for 200 societies...")
+    """Generates a sample CSV file if the actual data files are not found."""
+    st.warning(f"Data files ('{CANONICAL_DATA_FILE}' and '{RAW_SOURCE_FILE}') not found. Generating dummy data for 200 societies...")
     
     cities = ['Mumbai', 'Delhi', 'Bangalore', 'Hyderabad', 'Chennai']
     dark_stores = [f'DS{i:03d}' for i in range(1, 11)]
@@ -28,8 +28,6 @@ def generate_dummy_data():
     for i in range(1, 201):
         orders = np.random.randint(50, 2500)
         stage = np.random.choice(KANBAN_STAGES, p=[0.25, 0.30, 0.15, 0.25, 0.05])
-        
-        # Calculate days in stage (simulated)
         days_in_stage = np.random.randint(0, 15) if stage != 'Migrated' else 0
         
         data.append({
@@ -45,7 +43,7 @@ def generate_dummy_data():
         
     df = pd.DataFrame(data)
     
-    # Create OrderRangeBucket
+    # Create OrderRangeBucket (same logic as before)
     df['OrderRangeBucket'] = pd.cut(
         df['AvgOrdersPerDay'],
         bins=[0, 100, 300, 500, 1000, 2000, 99999],
@@ -53,9 +51,8 @@ def generate_dummy_data():
         right=False
     ).astype(str)
 
-    # Save the dummy file
-    df.to_csv(DATA_FILE, index=False)
-    st.info("Dummy data generated! Please replace this file with your actual data.")
+    df.to_csv(CANONICAL_DATA_FILE, index=False)
+    st.info("Dummy data generated and saved as 'societies_migration.csv'.")
     return df
 
 
@@ -63,62 +60,118 @@ def generate_dummy_data():
 
 @st.cache_data(show_spinner="Loading and preparing data...")
 def load_and_prepare_data():
-    """Loads data, ensures correct types, and calculates DaysInStage."""
+    """Loads data, ensuring correct types, and calculates DaysInStage."""
     
-    if not os.path.exists(DATA_FILE):
+    source_file_used = CANONICAL_DATA_FILE
+
+    # --- Step 1: Check for Canonical Data File ---
+    if os.path.exists(CANONICAL_DATA_FILE):
+        file_to_load = CANONICAL_DATA_FILE
+    
+    # --- Step 2: Check for Raw Source File (First Run Initialization) ---
+    elif os.path.exists(RAW_SOURCE_FILE):
+        st.warning(f"'{CANONICAL_DATA_FILE}' not found. Initializing Kanban data from raw source: '{RAW_SOURCE_FILE}'...")
+        
+        try:
+            # Read the raw file, skipping initial descriptive rows (header is at index 2)
+            # The structure of the raw file is complex, so we use header=2 to get the usable headers
+            df_raw = pd.read_csv(RAW_SOURCE_FILE, header=2) 
+            
+            # --- Column Mapping to Kanban Schema ---
+            column_mapping = {
+                'Society ID': 'SocietyID',
+                'Society Name': 'SocietyName',
+                'Store Name': 'AssignedDarkStoreID',
+                df_raw.columns[0].strip(): 'City', # Assuming the first data column is City Name
+                'Daily Qty': 'AvgOrdersPerDay'
+            }
+            
+            df_raw.rename(columns=column_mapping, inplace=True)
+            
+            # Select required columns and drop rows with missing IDs
+            df_kanban = df_raw.filter(items=[
+                'SocietyID', 'SocietyName', 'AssignedDarkStoreID', 'City', 'AvgOrdersPerDay'
+            ], axis=1).dropna(subset=['SocietyID', 'AvgOrdersPerDay'])
+            
+            # --- Initialize Kanban Status Columns ---
+            df_kanban['MigrationStage'] = KANBAN_STAGES[0] # 'Not Started'
+            df_kanban['MigrationStartedOn'] = TODAY
+            df_kanban['LastUpdated'] = TODAY
+            
+            # Convert numeric types after cleaning
+            df_kanban['AvgOrdersPerDay'] = pd.to_numeric(df_kanban['AvgOrdersPerDay'], errors='coerce').fillna(0).round(0).astype(int)
+            
+            # Save the newly structured data as the canonical file for future runs
+            df_kanban.to_csv(CANONICAL_DATA_FILE, index=False, date_format='%Y-%m-%dT%H:%M:%S')
+            st.success(f"Successfully processed raw data and created '{CANONICAL_DATA_FILE}'.")
+            
+            file_to_load = CANONICAL_DATA_FILE
+            source_file_used = RAW_SOURCE_FILE
+            
+        except Exception as e:
+            st.error(f"Error processing raw data '{RAW_SOURCE_FILE}': {e}")
+            return generate_dummy_data()
+
+    # --- Step 3: Fallback to Dummy Data ---
+    else:
         return generate_dummy_data()
 
+
+    # --- Step 4: Load and Finalize Data (Common Logic) ---
     try:
-        df = pd.read_csv(DATA_FILE)
+        df = pd.read_csv(file_to_load)
         
         # Type conversion and date handling
         df['SocietyID'] = df['SocietyID'].astype(str) 
         df['AvgOrdersPerDay'] = pd.to_numeric(df['AvgOrdersPerDay'], errors='coerce').fillna(0).round(0).astype(int)
         
-        # Calculate Days In Stage: Must handle potential NaT (Not a Time) errors
+        # Calculate Days In Stage
         df['MigrationStartedOn'] = pd.to_datetime(df['MigrationStartedOn'], errors='coerce')
         
-        # Calculate days difference only if MigrationStartedOn is valid
         # Filter out societies not in a valid Kanban stage
         df = df[df['MigrationStage'].isin(KANBAN_STAGES)].copy()
         df['DaysInStage'] = (TODAY - df['MigrationStartedOn']).dt.days.clip(lower=0).fillna(0).astype(int)
         
         # Ensure OrderRangeBucket exists for filtering
         if 'OrderRangeBucket' not in df.columns:
-            st.warning("OrderRangeBucket missing; dynamically generating from AvgOrdersPerDay.")
+            # Generate the order bucket based on the 'Daily Qty' data
             df['OrderRangeBucket'] = pd.cut(
                 df['AvgOrdersPerDay'],
                 bins=[0, 100, 300, 500, 1000, 2000, 99999],
                 labels=['1-100', '101-300', '301-500', '501-1000', '1001-2000', '2000+'],
                 right=False
             ).astype(str)
-
+        
+        # Set the used source file name in the session state for display in main()
+        st.session_state['data_source'] = source_file_used
+        
         return df
     
     except Exception as e:
-        st.error(f"Error loading data: {e}. Check column names and types in your CSV.")
+        st.error(f"Error loading final data: {e}. Check column names and types in your '{file_to_load}' file.")
         return pd.DataFrame()
 
 
 def save_data(df):
     """Saves the DataFrame back to the CSV file and clears cache to force reload."""
     try:
-        # Save only the necessary columns back to avoid writing calculated columns
+        # Save only the necessary columns back (the canonical schema)
         cols_to_save = [
             'SocietyID', 'SocietyName', 'AssignedDarkStoreID', 'City', 
             'AvgOrdersPerDay', 'MigrationStage', 'MigrationStartedOn', 
-            'LastUpdated', 'OrderRangeBucket' # Save the bucket if it was generated
+            'LastUpdated', 'OrderRangeBucket'
         ]
         
-        # Filter columns to only those that exist in the DataFrame
+        # Ensure only existing columns are saved
         final_cols = [col for col in cols_to_save if col in df.columns]
         
-        df[final_cols].to_csv(DATA_FILE, index=False, date_format='%Y-%m-%dT%H:%M:%S')
+        # Use the canonical data file name for saving persistence
+        df[final_cols].to_csv(CANONICAL_DATA_FILE, index=False, date_format='%Y-%m-%dT%H:%M:%S')
         st.cache_data.clear() # Clears the cache to force load_and_prepare_data() to re-read the file
         st.toast("Status updated successfully! Refreshing...", icon="✅")
         return True
     except Exception as e:
-        st.error(f"Error saving data: {e}")
+        st.error(f"Error saving data: {e}. This usually happens in Streamlit Cloud where file changes are not persistent.")
         return False
 
 
@@ -157,20 +210,28 @@ def main():
     if df_master.empty:
         return
 
+    # Get the data source for the caption
+    data_source_name = st.session_state.get('data_source', CANONICAL_DATA_FILE)
+
     st.title("🏗️ Society Migration Tracker (Kanban)")
-    st.caption(f"Tracking {len(df_master)} Societies | Source: `{DATA_FILE}`")
+    st.caption(f"Tracking {len(df_master)} Societies | Source: `{data_source_name}`")
 
     # --- 1. Sidebar Filters ---
     with st.sidebar:
         st.header("Filter View")
         
-        cities = sorted(df_master['City'].dropna().unique())
-        dark_stores = sorted(df_master['AssignedDarkStoreID'].dropna().unique())
-        order_ranges = sorted(df_master['OrderRangeBucket'].dropna().unique())
-        
-        selected_city = st.multiselect("City", cities, default=[])
-        selected_ds = st.multiselect("Dark Store ID", dark_stores, default=[])
-        selected_order_range = st.multiselect("Order Range", order_ranges, default=[])
+        # Ensure all filtering columns exist before trying to access unique values
+        if all(col in df_master.columns for col in ['City', 'AssignedDarkStoreID', 'OrderRangeBucket']):
+            cities = sorted(df_master['City'].dropna().unique())
+            dark_stores = sorted(df_master['AssignedDarkStoreID'].dropna().unique())
+            order_ranges = sorted(df_master['OrderRangeBucket'].dropna().unique())
+            
+            selected_city = st.multiselect("City", cities, default=[])
+            selected_ds = st.multiselect("Dark Store ID", dark_stores, default=[])
+            selected_order_range = st.multiselect("Order Range", order_ranges, default=[])
+        else:
+            st.error("Missing columns for filtering. Check data file structure.")
+            return
 
     # --- 2. Apply Filters ---
     filtered_df = df_master.copy()
@@ -201,7 +262,8 @@ def main():
     st.divider()
     
     # --- 4. Kanban Board Display ---
-    cols = st.columns(len(KANBAN_STAGES))
+    # Adjust column sizing to give more room to the board
+    cols = st.columns(len(KANBAN_STAGES), gap="large")
 
     for i, stage in enumerate(KANBAN_STAGES):
         # Filter data for the current stage, sorting by aging (DaysInStage)
@@ -258,4 +320,8 @@ def main():
                     
 # Run the main function
 if __name__ == "__main__":
+    # Initialize session state for data source tracking
+    if 'data_source' not in st.session_state:
+        st.session_state['data_source'] = CANONICAL_DATA_FILE
+        
     main()
